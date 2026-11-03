@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#111318">
+<title>Private Characters</title>
+<style>
+  :root{--bg:#111318;--panel:#1a1d24;--panel2:#232732;--line:#2e3340;--text:#e9ebf0;--muted:#9aa1b2;--accent:#8b7cf6;--accent2:#6d5ee8;--danger:#e5484d;--me:#3b3570}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  #app{height:100%;display:flex;flex-direction:column;max-width:720px;margin:0 auto}
+  header{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:2}
+  header h1{font-size:18px;margin:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  main{flex:1;overflow-y:auto;padding:14px}
+  button{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 14px;cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:active{background:var(--accent2)}
+  button.danger{color:var(--danger)}
+  button.icon{padding:7px 11px}
+  button:disabled{opacity:.5}
+  input,textarea,select{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;width:100%}
+  textarea{resize:vertical;min-height:80px}
+  label{display:block;font-size:14px;color:var(--muted);margin:14px 0 6px}
+  .hint{font-size:13px;color:var(--muted);margin-top:6px}
+  .card{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid var(--line);background:var(--panel);border-radius:14px;margin-bottom:10px;cursor:pointer}
+  .avatar{width:46px;height:46px;border-radius:50%;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-size:24px;flex:none}
+  .card .info{flex:1;min-width:0}
+  .card .name{font-weight:600}
+  .card .sub{color:var(--muted);font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .empty{color:var(--muted);text-align:center;padding:40px 10px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
+  .center{max-width:380px;margin:12vh auto 0;text-align:center}
+  .center input{text-align:center;margin-top:10px}
+  .err{color:var(--danger);min-height:22px;margin-top:8px;font-size:14px}
+  .msgs{display:flex;flex-direction:column;gap:10px}
+  .bubble{max-width:86%;padding:10px 13px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word}
+  .bubble.ai{background:var(--panel2);align-self:flex-start;border-bottom-left-radius:4px}
+  .bubble.me{background:var(--me);align-self:flex-end;border-bottom-right-radius:4px}
+  .bubble em{color:#c6bff9}
+  .composer{display:flex;gap:8px;padding:10px;border-top:1px solid var(--line);background:var(--panel)}
+  .composer textarea{min-height:44px;max-height:140px;flex:1;resize:none}
+  .status{font-size:13px;color:var(--muted);padding:6px 14px;background:var(--panel);border-top:1px solid var(--line)}
+  .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:6px}
+  .bar>div{height:100%;background:var(--accent);width:0;transition:width .2s}
+  .typing{color:var(--muted)}
+  .tools{display:flex;gap:8px;justify-content:center;margin-top:6px}
+  .tools button{font-size:13px;padding:5px 10px}
+  h2{font-size:16px;margin:22px 0 4px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script type="module">
+/* ============================================================
+   Private Characters: everything runs and is stored on this device.
+   - Characters + chats are encrypted with your passphrase
+     (AES-GCM, key from PBKDF2 with 600k rounds) before being saved.
+   - The AI model runs in this browser via WebGPU. After the one-time
+     download, chatting needs no internet and sends nothing anywhere.
+   ============================================================ */
+
+const VAULT_KEY = 'pc_vault_v1';
+const LOCK_AFTER_MS = 2 * 60 * 1000;     // auto-lock after 2 min in background
+const HISTORY_CHARS = 7000;              // how much chat history the AI sees
+const MODEL_PREFS = [
+  { base: 'Hermes-3-Llama-3.2-3B-', label: 'Hermes 3 (3B), best for roleplay' },
+  { base: 'Llama-3.2-3B-Instruct-', label: 'Llama 3.2 (3B), balanced' },
+  { base: 'Qwen2.5-3B-Instruct-',  label: 'Qwen 2.5 (3B), balanced' },
+  { base: 'Llama-3.2-1B-Instruct-', label: 'Llama 3.2 (1B), fastest, simplest' },
+];
+
+const $app = document.getElementById('app');
+let key = null, salt = null, state = null;
+let view = { name: 'list' };
+let hiddenAt = 0;
+
+/* ---------------- helpers ---------------- */
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = s => esc(s).replace(/\*([^*\n]+)\*/g, '<em>*$1*</em>');
+const uid = () => crypto.getRandomValues(new Uint32Array(2)).join('-');
+const te = new TextEncoder(), td = new TextDecoder();
+function toB64(buf){ const u = new Uint8Array(buf); let s=''; for (let i=0;i<u.length;i+=0x8000) s += String.fromCharCode.apply(null, u.subarray(i,i+0x8000)); return btoa(s); }
+function fromB64(b){ const s = atob(b); const u = new Uint8Array(s.length); for (let i=0;i<s.length;i++) u[i]=s.charCodeAt(i); return u; }
+
+/* ---------------- encryption ---------------- */
+async function deriveKey(pass, saltBytes){
+  const base = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name:'PBKDF2', salt:saltBytes, iterations:600000, hash:'SHA-256' },
+    base, { name:'AES-GCM', length:256 }, false, ['encrypt','decrypt']);
+}
+async function save(){
+  if (!key || !state) return;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, te.encode(JSON.stringify(state)));
+  try {
+    localStorage.setItem(VAULT_KEY, JSON.stringify({ v:1, salt:toB64(salt), iv:toB64(iv), ct:toB64(ct) }));
+  } catch (e) {
+    alert('Storage is full. Export a backup, then clear some old chats.');
+  }
+}
+async function unlock(pass){
+  const vault = JSON.parse(localStorage.getItem(VAULT_KEY));
+  const s = fromB64(vault.salt);
+  const k = await deriveKey(pass, s);
+  const pt = await crypto.subtle.decrypt({ name:'AES-GCM', iv:fromB64(vault.iv) }, k, fromB64(vault.ct));
+  salt = s; key = k; state = JSON.parse(td.decode(pt));
+  state.characters ??= []; state.chats ??= {}; state.userName ??= 'You';
+}
+async function createVault(pass){
+  salt = crypto.getRandomValues(new Uint8Array(16));
+  key = await deriveKey(pass, salt);
+  state = { userName:'You', model:null, characters:[], chats:{} };
+  await save();
+}
+function lock(){
+  key = null; state = null; view = { name:'list' };
+  if (engine && !generating) { try { engine.resetChat(); } catch {} }
+  render();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) hiddenAt = Date.now();
+  else if (key && hiddenAt && Date.now() - hiddenAt > LOCK_AFTER_MS) lock();
+});
+
+/* ---------------- AI engine (WebLLM, runs on your GPU) ---------------- */
+let webllm = null, engine = null, loadedModel = null, loadingPromise = null, generating = false;
+let progress = { pct:0, text:'' };
+
+async function getLib(){
+  if (webllm) return webllm;
+  try { webllm = await import('https://esm.run/@mlc-ai/web-llm@0.2.79'); }
+  catch { webllm = await import('https://esm.run/@mlc-ai/web-llm'); }
+  return webllm;
+}
+async function modelOptions(){
+  const lib = await getLib();
+  let f16 = false;
+  try { const a = await navigator.gpu?.requestAdapter(); f16 = !!a && a.features.has('shader-f16'); } catch {}
+  const ids = new Set(lib.prebuiltAppConfig.model_list.map(m => m.model_id));
+  for (const quant of (f16 ? ['q4f16_1','q4f32_1'] : ['q4f32_1'])) {
+    const opts = MODEL_PREFS.map(p => ({ ...p, id: `${p.base}${quant}-MLC` })).filter(p => ids.has(p.id));
+    if (opts.length) return opts;
+  }
+  return lib.prebuiltAppConfig.model_list.slice(0, 6).map(m => ({ id:m.model_id, label:m.model_id }));
+}
+async function ensureEngine(){
+  if (!navigator.gpu) throw new Error('This browser has no WebGPU. Update Chrome and open this page from http://localhost.');
+  const opts = await modelOptions();
+  const want = (state.model && opts.some(o => o.id === state.model)) ? state.model : opts[0].id;
+  if (engine && loadedModel === want) return engine;
+  if (loadingPromise) return loadingPromise;
+  const lib = await getLib();
+  const cb = r => { progress = { pct: Math.round((r.progress||0)*100), text: r.text||'' }; paintStatus(); };
+  loadingPromise = (async () => {
+    progress = { pct:0, text:'Starting AI…' }; paintStatus();
+    if (engine) await engine.reload(want);
+    else engine = await lib.CreateMLCEngine(want, { initProgressCallback: cb });
+    loadedModel = want; progress = { pct:100, text:'' };
+    return engine;
+  })();
+  try { return await loadingPromise; } finally { loadingPromise = null; paintStatus(); }
+}
+
+/* ---------------- prompt building ---------------- */
+function buildMessages(c, chat){
+  const u = state.userName || 'You';
+  let sys = `You are ${c.name}. This is a private, ongoing roleplay chat between ${c.name} and ${u}. Stay fully in character as ${c.name} at all times. Write only ${c.name}'s replies, never ${u}'s lines. Keep replies natural and conversational. Use *asterisks* for actions.`;
+  if (c.personality) sys += `\n\n${c.name}'s personality and background:\n${c.personality}`;
+  if (c.style) sys += `\n\nHow ${c.name} talks:\n${c.style}`;
+  if (c.scenario) sys += `\n\nScenario:\n${c.scenario}`;
+  const greeting = chat.find(m => m.greeting);
+  if (greeting) sys += `\n\nThe chat began with ${c.name} saying: "${greeting.content}"`;
+
+  // take recent history that fits, ensure it starts with a user turn and alternates
+  const hist = chat.filter(m => !m.greeting && m.content);
+  const picked = []; let total = 0;
+  for (let i = hist.length - 1; i >= 0; i--) { total += hist[i].content.length; if (total > HISTORY_CHARS && picked.length) break; picked.unshift(hist[i]); }
+  while (picked.length && picked[0].role !== 'user') picked.shift();
+  const msgs = [];
+  for (const m of picked) {
+    const last = msgs[msgs.length-1];
+    if (last && last.role === m.role) last.content += '\n' + m.content;
+    else msgs.push({ role:m.role, content:m.content });
+  }
+  return [{ role:'system', content:sys }, ...msgs];
+}
+function cleanReply(text, c){
+  let t = text.replace(new RegExp('^\\s*' + c.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\s*:\\s*'), '');
+  const u = (state.userName||'You').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const cut = t.search(new RegExp('\\n\\s*' + u + '\\s*:'));
+  if (cut > 0) t = t.slice(0, cut);
+  return t.trim();
+}
+
+/* ---------------- rendering ---------------- */
+function render(){
+  if (!key) return renderLock();
+  ({ list:renderList, edit:renderEdit, chat:renderChat, settings:renderSettings })[view.name]();
+}
+
+function renderLock(){
+  const exists = !!localStorage.getItem(VAULT_KEY);
+  $app.innerHTML = `<main><div class="center">
+    <div style="font-size:48px">🔒</div>
+    <h1 style="font-size:22px">${exists ? 'Unlock' : 'Create your passphrase'}</h1>
+    <p class="hint">${exists ? 'Enter your passphrase to open your characters.' :
+      'This encrypts your characters and chats on this phone. There is no reset. If you forget it, the data cannot be recovered. Longer is safer (a few words works well).'}</p>
+    <input id="p1" type="password" placeholder="Passphrase" autocomplete="off">
+    ${exists ? '' : '<input id="p2" type="password" placeholder="Type it again" autocomplete="off">'}
+    <div class="err" id="err"></div>
+    <button class="primary" id="go" style="width:100%;margin-top:6px">${exists ? 'Unlock' : 'Create'}</button>
+  </div></main>`;
+  const go = async () => {
+    const p1 = document.getElementById('p1').value, err = document.getElementById('err');
+    const btn = document.getElementById('go');
+    if (!exists) {
+      if (p1.length < 6) return err.textContent = 'Use at least 6 characters.';
+      if (p1 !== document.getElementById('p2').value) return err.textContent = "Passphrases don't match.";
+    }
+    btn.disabled = true; btn.textContent = 'Working…';
+    try { exists ? await unlock(p1) : await createVault(p1); render(); }
+    catch { err.textContent = 'Wrong passphrase.'; btn.disabled = false; btn.textContent = 'Unlock'; }
+  };
+  document.getElementById('go').onclick = go;
+  $app.querySelectorAll('input').forEach(i => i.onkeydown = e => { if (e.key === 'Enter') go(); });
+  document.getElementById('p1').focus();
+}
+
+function renderList(){
+  const cs = state.characters;
+  $app.innerHTML = `<header><h1>Characters</h1>
+      <button class="icon" id="settings" title="Settings">⚙️</button>
+      <button class="icon" id="lock" title="Lock">🔒</button></header>
+    <main>
+      ${cs.length ? cs.map(c => {
+        const last = (state.chats[c.id]||[]).filter(m=>m.content).slice(-1)[0];
+        return `<div class="card" data-id="${c.id}"><div class="avatar">${esc(c.avatar||'🙂')}</div>
+          <div class="info"><div class="name">${esc(c.name)}</div>
+          <div class="sub">${esc(last ? last.content : (c.personality||'').slice(0,80))}</div></div></div>`;
+      }).join('') : `<div class="empty">No characters yet.<br>Make your first one below.</div>`}
+      <button class="primary" id="new" style="width:100%;margin-top:6px">＋ New character</button>
+    </main>`;
+  $app.querySelectorAll('.card').forEach(el => el.onclick = () => { view = { name:'chat', id:el.dataset.id }; render(); });
+  document.getElementById('new').onclick = () => { view = { name:'edit', id:null }; render(); };
+  document.getElementById('settings').onclick = () => { view = { name:'settings' }; render(); };
+  document.getElementById('lock').onclick = lock;
+}
+
+function renderEdit(){
+  const c = state.characters.find(x => x.id === view.id) || { name:'', avatar:'🙂', personality:'', style:'', scenario:'', greeting:'' };
+  $app.innerHTML = `<header><button class="icon" id="back">←</button><h1>${view.id ? 'Edit character' : 'New character'}</h1></header>
+    <main>
+      <label>Name</label><input id="f_name" value="${esc(c.name)}" placeholder="e.g. Captain Mara">
+      <label>Avatar (an emoji)</label><input id="f_avatar" value="${esc(c.avatar)}" maxlength="4">
+      <label>Personality &amp; background</label>
+      <textarea id="f_personality" rows="5" placeholder="Who are they? Age, history, what they care about, quirks…">${esc(c.personality)}</textarea>
+      <label>How they talk</label>
+      <textarea id="f_style" rows="3" placeholder="e.g. Dry humor, short sentences, calls you 'kid'.">${esc(c.style)}</textarea>
+      <label>Scenario (optional)</label>
+      <textarea id="f_scenario" rows="3" placeholder="Where are you two and what's going on?">${esc(c.scenario)}</textarea>
+      <label>First message (optional)</label>
+      <textarea id="f_greeting" rows="3" placeholder="What they say when a chat starts.">${esc(c.greeting)}</textarea>
+      <div class="hint">Changes apply to future replies. The first message shows when a chat is new or cleared.</div>
+      <div class="row">
+        <button class="primary" id="save" style="flex:1">Save</button>
+        ${view.id ? '<button class="danger" id="del">Delete</button>' : ''}
+      </div>
+    </main>`;
+  const back = () => { view = view.id ? { name:'chat', id:view.id } : { name:'list' }; render(); };
+  document.getElementById('back').onclick = back;
+  document.getElementById('save').onclick = async () => {
+    const g = id => document.getElementById(id).value.trim();
+    const data = { name:g('f_name'), avatar:g('f_avatar')||'🙂', personality:g('f_personality'), style:g('f_style'), scenario:g('f_scenario'), greeting:g('f_greeting') };
+    if (!data.name) return alert('Give your character a name.');
+    if (view.id) Object.assign(state.characters.find(x => x.id === view.id), data);
+    else { const id = uid(); state.characters.push({ id, ...data }); view.id = id; }
+    await save(); view = { name:'chat', id:view.id }; render();
+  };
+  const del = document.getElementById('del');
+  if (del) del.onclick = async () => {
+    if (!confirm(`Delete ${c.name} and the whole chat with them? This can't be undone.`)) return;
+    state.characters = state.characters.filter(x => x.id !== view.id);
+    delete state.chats[view.id]; await save(); view = { name:'list' }; render();
+  };
+}
+
+function getChat(c){
+  let chat = state.chats[c.id];
+  if (!chat) chat = state.chats[c.id] = [];
+  if (!chat.length && c.greeting) chat.push({ role:'assistant', content:c.greeting, greeting:true });
+  return chat;
+}
+
+function renderChat(){
+  const c = state.characters.find(x => x.id === view.id);
+  if (!c) { view = { name:'list' }; return render(); }
+  const chat = getChat(c);
+  $app.innerHTML = `<header><button class="icon" id="back">←</button>
+      <div class="avatar" style="width:34px;height:34px;font-size:18px">${esc(c.avatar||'🙂')}</div>
+      <h1>${esc(c.name)}</h1>
+      <button class="icon" id="edit" title="Edit character">✏️</button></header>
+    <main id="scroll"><div class="msgs" id="msgs"></div><div class="tools" id="tools"></div></main>
+    <div class="status" id="status" hidden></div>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="Message ${esc(c.name)}…"></textarea>
+      <button class="primary" id="send">Send</button>
+    </div>`;
+  document.getElementById('back').onclick = () => { if (!generating) { view = { name:'list' }; render(); } };
+  document.getElementById('edit').onclick = () => { if (!generating) { view = { name:'edit', id:c.id }; render(); } };
+  const input = document.getElementById('input');
+  input.oninput = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 140) + 'px'; };
+  document.getElementById('send').onclick = () => {
+    if (generating) { try { engine.interruptGenerate(); } catch {} return; }
+    const t = input.value.trim(); if (!t) return;
+    input.value = ''; input.oninput();
+    chat.push({ role:'user', content:t }); save();
+    respond(c, chat);
+  };
+  paintMsgs(c, chat); paintStatus();
+}
+
+function paintMsgs(c, chat){
+  const box = document.getElementById('msgs'); if (!box) return;
+  box.innerHTML = chat.length ? chat.map(m =>
+    `<div class="bubble ${m.role === 'user' ? 'me' : 'ai'}">${m.content ? fmt(m.content) : '<span class="typing">…</span>'}</div>`).join('')
+    : `<div class="empty">Say hi to ${esc(c.name)}.</div>`;
+  const tools = document.getElementById('tools');
+  const last = chat[chat.length-1];
+  tools.innerHTML = generating ? '' :
+    (last && last.role === 'assistant' && !last.greeting ? '<button id="regen">↻ Redo reply</button>' : '') +
+    (last && last.role === 'user' ? '<button id="retry">↻ Get reply</button>' : '') +
+    (chat.some(m => !m.greeting) ? '<button id="clear">Clear chat</button>' : '');
+  const rg = document.getElementById('regen'); if (rg) rg.onclick = () => { chat.pop(); respond(c, chat); };
+  const rt = document.getElementById('retry'); if (rt) rt.onclick = () => respond(c, chat);
+  const cl = document.getElementById('clear'); if (cl) cl.onclick = async () => {
+    if (!confirm(`Clear your whole chat with ${c.name}?`)) return;
+    state.chats[c.id] = []; await save(); renderChat();
+  };
+  const sc = document.getElementById('scroll'); sc.scrollTop = sc.scrollHeight;
+}
+
+function paintStatus(){
+  const el = document.getElementById('status'); if (!el) return;
+  const loading = !!loadingPromise;
+  el.hidden = !loading;
+  if (loading) el.innerHTML = `${esc(progress.text || 'Loading AI…')}<div class="bar"><div style="width:${progress.pct}%"></div></div>
+    <div class="hint">The first time downloads the AI model (about 1–2 GB, Wi-Fi recommended). After that it loads from your phone.</div>`;
+  const send = document.getElementById('send');
+  if (send) send.textContent = generating ? 'Stop' : 'Send';
+}
+
+async function respond(c, chat){
+  if (generating) return;
+  generating = true; paintStatus();
+  const reply = { role:'assistant', content:'' };
+  chat.push(reply); paintMsgs(c, chat);
+  try {
+    await ensureEngine();
+    const msgs = buildMessages(c, chat.slice(0, -1));
+    const stream = await engine.chat.completions.create({ messages:msgs, stream:true, temperature:0.8, top_p:0.95, max_tokens:350, frequency_penalty:0.4 });
+    for await (const part of stream) {
+      reply.content += part.choices[0]?.delta?.content || '';
+      if (view.name === 'chat' && view.id === c.id) {
+        const bubbles = document.querySelectorAll('#msgs .bubble');
+        const b = bubbles[bubbles.length-1];
+        if (b) { b.innerHTML = fmt(reply.content); const sc = document.getElementById('scroll'); sc.scrollTop = sc.scrollHeight; }
+      }
+    }
+    reply.content = cleanReply(reply.content, c);
+  } catch (e) {
+    chat.pop();
+    alert('The AI could not reply: ' + (e?.message || e));
+  } finally {
+    if (!reply.content && chat[chat.length-1] === reply) chat.pop();
+    generating = false;
+    if (state) { await save(); if (view.name === 'chat' && view.id === c.id) renderChat(); }
+  }
+}
+
+async function renderSettings(){
+  $app.innerHTML = `<header><button class="icon" id="back">←</button><h1>Settings</h1></header>
+    <main>
+      <label>Your name (what characters call you)</label>
+      <input id="s_user" value="${esc(state.userName)}">
+      <label>AI model</label>
+      <select id="s_model"><option>Checking what your phone supports…</option></select>
+      <div class="hint">Bigger models write better, smaller ones reply faster. Each model is a separate one-time download.</div>
+      <button class="primary" id="s_save" style="width:100%;margin-top:14px">Save</button>
+
+      <h2>Backup</h2>
+      <div class="hint">The backup file stays encrypted with your passphrase. Clearing Chrome's site data deletes everything, so keep a backup.</div>
+      <div class="row"><button id="export">Export backup</button><button id="import">Import backup</button></div>
+      <input type="file" id="file" accept=".json,application/json" hidden>
+
+      <h2>Passphrase</h2>
+      <label>New passphrase</label><input id="np1" type="password" autocomplete="off">
+      <label>Type it again</label><input id="np2" type="password" autocomplete="off">
+      <button id="chpass" style="margin-top:10px">Change passphrase</button>
+    </main>`;
+  document.getElementById('back').onclick = () => { view = { name:'list' }; render(); };
+  document.getElementById('s_save').onclick = async () => {
+    state.userName = document.getElementById('s_user').value.trim() || 'You';
+    const m = document.getElementById('s_model').value; if (m && !m.startsWith('Checking')) state.model = m;
+    await save(); view = { name:'list' }; render();
+  };
+  document.getElementById('export').onclick = () => {
+    const blob = new Blob([localStorage.getItem(VAULT_KEY)], { type:'application/json' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = `characters-backup-${new Date().toISOString().slice(0,10)}.json`; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  };
+  const file = document.getElementById('file');
+  document.getElementById('import').onclick = () => file.click();
+  file.onchange = async () => {
+    const f = file.files[0]; if (!f) return;
+    try {
+      const txt = await f.text(); const v = JSON.parse(txt);
+      if (!v.salt || !v.iv || !v.ct) throw 0;
+      if (!confirm('Replace everything here with this backup? You will need the passphrase the backup was made with.')) return;
+      localStorage.setItem(VAULT_KEY, txt); lock();
+    } catch { alert("That doesn't look like a backup file from this app."); }
+  };
+  document.getElementById('chpass').onclick = async () => {
+    const a = document.getElementById('np1').value, b = document.getElementById('np2').value;
+    if (a.length < 6) return alert('Use at least 6 characters.');
+    if (a !== b) return alert("Passphrases don't match.");
+    salt = crypto.getRandomValues(new Uint8Array(16)); key = await deriveKey(a, salt);
+    await save(); alert('Passphrase changed. Export a new backup, since old backups still use the old passphrase.');
+    document.getElementById('np1').value = document.getElementById('np2').value = '';
+  };
+  // fill model list (needs the AI library; downloaded once)
+  const sel = document.getElementById('s_model');
+  try {
+    const opts = await modelOptions();
+    const cur = state.model && opts.some(o => o.id === state.model) ? state.model : opts[0].id;
+    sel.innerHTML = opts.map(o => `<option value="${esc(o.id)}" ${o.id === cur ? 'selected' : ''}>${esc(o.label)}</option>`).join('');
+  } catch {
+    sel.innerHTML = '<option value="">Connect to the internet once to see models</option>';
+  }
+}
+
+render();
+</script>
+</body>
+</html>
