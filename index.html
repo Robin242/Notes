@@ -179,6 +179,7 @@ function buildMessages(c, chat){
   let sys = `You are ${c.name}. This is a private, ongoing fictional roleplay chat between ${c.name} and ${u}, an adult. Stay fully in character as ${c.name} at all times; never break character to lecture, moralize or add disclaimers. Write only ${c.name}'s replies, never ${u}'s lines. Keep replies natural and conversational. Use *asterisks* for actions.`;
   if (c.personality) sys += `\n\n${c.name}'s personality and background:\n${c.personality}`;
   if (c.style) sys += `\n\nHow ${c.name} talks:\n${c.style}`;
+  if (c.role) sys += `\n\n${u}'s role in this story (always treat ${u} this way):\n${c.role}`;
   if (c.scenario) sys += `\n\nScenario:\n${c.scenario}`;
   if (c.memory) sys += `\n\nThings ${c.name} always remembers:\n${c.memory}`;
   const greeting = chat.find(m => m.greeting);
@@ -308,6 +309,8 @@ function renderEdit(){
       <textarea id="f_personality" rows="5" placeholder="Who are they? Age, history, what they care about, quirks…">${esc(c.personality)}</textarea>
       <label>How they talk</label>
       <textarea id="f_style" rows="3" placeholder="e.g. Dry humor, short sentences, calls you 'kid'.">${esc(c.style)}</textarea>
+      <label>Your role (optional)</label>
+      <textarea id="f_role" rows="3" placeholder="Who you are to them, e.g. 'The new deckhand on her ship, a bit reckless but loyal.'">${esc(c.role||'')}</textarea>
       <label>Scenario (optional)</label>
       <textarea id="f_scenario" rows="3" placeholder="Where are you two and what's going on?">${esc(c.scenario)}</textarea>
       <label>First message (optional)</label>
@@ -327,7 +330,7 @@ function renderEdit(){
   document.getElementById('back').onclick = back;
   document.getElementById('save').onclick = async () => {
     const g = id => document.getElementById(id).value.trim();
-    const data = { name:g('f_name'), avatar:g('f_avatar')||'🙂', personality:g('f_personality'), style:g('f_style'), scenario:g('f_scenario'), greeting:g('f_greeting'), memory:g('f_memory') };
+    const data = { name:g('f_name'), avatar:g('f_avatar')||'🙂', personality:g('f_personality'), style:g('f_style'), scenario:g('f_scenario'), greeting:g('f_greeting'), memory:g('f_memory'), role:g('f_role') };
     if (!data.name) return alert('Give your character a name.');
     if (view.id) {
       const ch = state.characters.find(x => x.id === view.id);
