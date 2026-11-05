@@ -63,9 +63,11 @@
 
 const VAULT_KEY = 'pc_vault_v1';
 const LOCK_AFTER_MS = 2 * 60 * 1000;     // auto-lock after 2 min in background
-const HISTORY_CHARS = 7000;              // how much chat history the AI sees
+const CONTEXT_TOKENS = 8192;             // AI's working memory (2x the default)
+const HISTORY_CHARS = 18000;             // recent chat the AI reads word-for-word
+const KEEP_AFTER_SUMMARY = 10000;        // after folding old chat into memory, keep this much verbatim
 const MODEL_PREFS = [
-  { base: 'Hermes-3-Llama-3.2-3B-', label: 'Hermes 3 (3B), best for roleplay' },
+  { base: 'Hermes-3-Llama-3.2-3B-', label: 'Hermes 3 (3B), least filtered, best for roleplay' },
   { base: 'Llama-3.2-3B-Instruct-', label: 'Llama 3.2 (3B), balanced' },
   { base: 'Qwen2.5-3B-Instruct-',  label: 'Qwen 2.5 (3B), balanced' },
   { base: 'Llama-3.2-1B-Instruct-', label: 'Llama 3.2 (1B), fastest, simplest' },
@@ -127,6 +129,7 @@ document.addEventListener('visibilitychange', () => {
 /* ---------------- AI engine (WebLLM, runs on your GPU) ---------------- */
 let webllm = null, engine = null, loadedModel = null, loadingPromise = null, generating = false;
 let progress = { pct:0, text:'' };
+let statusMsg = '';
 
 async function getLib(){
   if (webllm) return webllm;
@@ -155,8 +158,15 @@ async function ensureEngine(){
   const cb = r => { progress = { pct: Math.round((r.progress||0)*100), text: r.text||'' }; paintStatus(); };
   loadingPromise = (async () => {
     progress = { pct:0, text:'Starting AI…' }; paintStatus();
-    if (engine) await engine.reload(want);
-    else engine = await lib.CreateMLCEngine(want, { initProgressCallback: cb });
+    const big = { context_window_size: CONTEXT_TOKENS };
+    try {
+      if (engine) await engine.reload(want, big);
+      else engine = await lib.CreateMLCEngine(want, { initProgressCallback: cb }, big);
+    } catch (e) {
+      // fall back to the model's default memory size if the bigger one doesn't fit
+      if (engine) await engine.reload(want);
+      else engine = await lib.CreateMLCEngine(want, { initProgressCallback: cb });
+    }
     loadedModel = want; progress = { pct:100, text:'' };
     return engine;
   })();
@@ -166,15 +176,18 @@ async function ensureEngine(){
 /* ---------------- prompt building ---------------- */
 function buildMessages(c, chat){
   const u = state.userName || 'You';
-  let sys = `You are ${c.name}. This is a private, ongoing roleplay chat between ${c.name} and ${u}. Stay fully in character as ${c.name} at all times. Write only ${c.name}'s replies, never ${u}'s lines. Keep replies natural and conversational. Use *asterisks* for actions.`;
+  let sys = `You are ${c.name}. This is a private, ongoing fictional roleplay chat between ${c.name} and ${u}, an adult. Stay fully in character as ${c.name} at all times; never break character to lecture, moralize or add disclaimers. Write only ${c.name}'s replies, never ${u}'s lines. Keep replies natural and conversational. Use *asterisks* for actions.`;
   if (c.personality) sys += `\n\n${c.name}'s personality and background:\n${c.personality}`;
   if (c.style) sys += `\n\nHow ${c.name} talks:\n${c.style}`;
   if (c.scenario) sys += `\n\nScenario:\n${c.scenario}`;
+  if (c.memory) sys += `\n\nThings ${c.name} always remembers:\n${c.memory}`;
   const greeting = chat.find(m => m.greeting);
   if (greeting) sys += `\n\nThe chat began with ${c.name} saying: "${greeting.content}"`;
+  const mem = getMem(c);
+  if (mem.text) sys += `\n\nWhat has happened earlier in this chat (${c.name}'s memory):\n${mem.text}`;
 
-  // take recent history that fits, ensure it starts with a user turn and alternates
-  const hist = chat.filter(m => !m.greeting && m.content);
+  // recent history (everything not yet folded into memory), starting with a user turn and alternating
+  const hist = chat.filter(m => !m.greeting && m.content).slice(mem.upto);
   const picked = []; let total = 0;
   for (let i = hist.length - 1; i >= 0; i--) { total += hist[i].content.length; if (total > HISTORY_CHARS && picked.length) break; picked.unshift(hist[i]); }
   while (picked.length && picked[0].role !== 'user') picked.shift();
@@ -186,6 +199,43 @@ function buildMessages(c, chat){
   }
   return [{ role:'system', content:sys }, ...msgs];
 }
+/* ---------------- long-term memory ---------------- */
+function getMem(c){
+  state.memory ??= {};
+  const m = state.memory[c.id] ??= { text:'', upto:0 };
+  const n = (state.chats[c.id]||[]).filter(x => !x.greeting && x.content).length;
+  if (m.upto > n) m.upto = n;            // chat was cleared or trimmed
+  return m;
+}
+// When the chat gets long, fold the oldest part into a written memory so nothing important is lost.
+async function summarizeIfNeeded(c, chat){
+  const mem = getMem(c);
+  const hist = chat.filter(m => !m.greeting && m.content);
+  const recent = hist.slice(mem.upto);
+  let total = recent.reduce((s, m) => s + m.content.length, 0);
+  if (total <= HISTORY_CHARS) return;
+  let cut = 0;
+  while (cut < recent.length - 2 && total > KEEP_AFTER_SUMMARY) { total -= recent[cut].content.length; cut++; }
+  if (!cut) return;
+  const u = state.userName || 'You';
+  const lines = recent.slice(0, cut).map(m => `${m.role === 'user' ? u : c.name}: ${m.content}`).join('\n');
+  statusMsg = `${c.name} is updating their memory…`; paintStatus();
+  try {
+    const r = await engine.chat.completions.create({
+      messages: [
+        { role:'system', content:'You keep the memory notes for an ongoing roleplay chat. Write plain text notes, no intro.' },
+        { role:'user', content:
+          `Current memory notes:\n${mem.text || '(none yet)'}\n\nNew part of the chat:\n${lines}\n\n` +
+          `Rewrite the memory notes so they include everything important from both: events in order, facts ${u} shared about themselves, ` +
+          `names, places, promises, inside jokes, and how ${c.name} feels about ${u}. Keep it under 300 words.` }
+      ],
+      temperature: 0.3, max_tokens: 500
+    });
+    const text = (r.choices[0]?.message?.content || '').trim();
+    if (text) { mem.text = text; mem.upto += cut; await save(); }
+  } catch {} finally { statusMsg = ''; paintStatus(); try { await engine.resetChat(); } catch {} }
+}
+
 function cleanReply(text, c){
   let t = text.replace(new RegExp('^\\s*' + c.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\s*:\\s*'), '');
   const u = (state.userName||'You').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
@@ -262,6 +312,11 @@ function renderEdit(){
       <textarea id="f_scenario" rows="3" placeholder="Where are you two and what's going on?">${esc(c.scenario)}</textarea>
       <label>First message (optional)</label>
       <textarea id="f_greeting" rows="3" placeholder="What they say when a chat starts.">${esc(c.greeting)}</textarea>
+      <label>Things they always remember (optional)</label>
+      <textarea id="f_memory" rows="3" placeholder="Facts they should never forget, e.g. your birthday, how you met, your dog's name.">${esc(c.memory||'')}</textarea>
+      ${view.id ? `<label>Their memory of your chat (written automatically)</label>
+      <textarea id="f_auto" rows="5" placeholder="Fills in by itself once your chat gets long.">${esc(getMem(c).text)}</textarea>
+      <div class="hint">When a chat gets long, the character writes notes about older parts so they don't forget them. You can fix or add to the notes here.</div>` : ''}
       <div class="hint">Changes apply to future replies. The first message shows when a chat is new or cleared.</div>
       <div class="row">
         <button class="primary" id="save" style="flex:1">Save</button>
@@ -272,9 +327,13 @@ function renderEdit(){
   document.getElementById('back').onclick = back;
   document.getElementById('save').onclick = async () => {
     const g = id => document.getElementById(id).value.trim();
-    const data = { name:g('f_name'), avatar:g('f_avatar')||'🙂', personality:g('f_personality'), style:g('f_style'), scenario:g('f_scenario'), greeting:g('f_greeting') };
+    const data = { name:g('f_name'), avatar:g('f_avatar')||'🙂', personality:g('f_personality'), style:g('f_style'), scenario:g('f_scenario'), greeting:g('f_greeting'), memory:g('f_memory') };
     if (!data.name) return alert('Give your character a name.');
-    if (view.id) Object.assign(state.characters.find(x => x.id === view.id), data);
+    if (view.id) {
+      const ch = state.characters.find(x => x.id === view.id);
+      Object.assign(ch, data);
+      if (document.getElementById('f_auto')) getMem(ch).text = g('f_auto');
+    }
     else { const id = uid(); state.characters.push({ id, ...data }); view.id = id; }
     await save(); view = { name:'chat', id:view.id }; render();
   };
@@ -282,7 +341,7 @@ function renderEdit(){
   if (del) del.onclick = async () => {
     if (!confirm(`Delete ${c.name} and the whole chat with them? This can't be undone.`)) return;
     state.characters = state.characters.filter(x => x.id !== view.id);
-    delete state.chats[view.id]; await save(); view = { name:'list' }; render();
+    delete state.chats[view.id]; if (state.memory) delete state.memory[view.id]; await save(); view = { name:'list' }; render();
   };
 }
 
@@ -336,7 +395,7 @@ function paintMsgs(c, chat){
   const rt = document.getElementById('retry'); if (rt) rt.onclick = () => respond(c, chat);
   const cl = document.getElementById('clear'); if (cl) cl.onclick = async () => {
     if (!confirm(`Clear your whole chat with ${c.name}?`)) return;
-    state.chats[c.id] = []; await save(); renderChat();
+    state.chats[c.id] = []; if (state.memory) delete state.memory[c.id]; await save(); renderChat();
   };
   const sc = document.getElementById('scroll'); sc.scrollTop = sc.scrollHeight;
 }
@@ -344,7 +403,8 @@ function paintMsgs(c, chat){
 function paintStatus(){
   const el = document.getElementById('status'); if (!el) return;
   const loading = !!loadingPromise;
-  el.hidden = !loading;
+  el.hidden = !loading && !statusMsg;
+  if (!loading && statusMsg) el.textContent = statusMsg;
   if (loading) el.innerHTML = `${esc(progress.text || 'Loading AI…')}<div class="bar"><div style="width:${progress.pct}%"></div></div>
     <div class="hint">The first time downloads the AI model (about 1–2 GB, Wi-Fi recommended). After that it loads from your phone.</div>`;
   const send = document.getElementById('send');
@@ -358,6 +418,7 @@ async function respond(c, chat){
   chat.push(reply); paintMsgs(c, chat);
   try {
     await ensureEngine();
+    await summarizeIfNeeded(c, chat.slice(0, -1));
     const msgs = buildMessages(c, chat.slice(0, -1));
     const stream = await engine.chat.completions.create({ messages:msgs, stream:true, temperature:0.8, top_p:0.95, max_tokens:350, frequency_penalty:0.4 });
     for await (const part of stream) {
