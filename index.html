@@ -175,11 +175,15 @@ async function ensureEngine(){
 
 /* ---------------- prompt building ---------------- */
 function buildMessages(c, chat){
-  const u = state.userName || 'You';
-  let sys = `You are ${c.name}. This is a private, ongoing fictional roleplay chat between ${c.name} and ${u}, an adult. Stay fully in character as ${c.name} at all times; never break character to lecture, moralize or add disclaimers. Write only ${c.name}'s replies, never ${u}'s lines. Keep replies natural and conversational. Use *asterisks* for actions.`;
-  if (c.personality) sys += `\n\n${c.name}'s personality and background:\n${c.personality}`;
-  if (c.style) sys += `\n\nHow ${c.name} talks:\n${c.style}`;
-  if (c.role) sys += `\n\n${u}'s role in this story (always treat ${u} this way):\n${c.role}`;
+  const u = userLabel();
+  let sys = `You are roleplaying as exactly ONE character: ${c.name}. The person chatting with you is ${u}, a real adult and NOT a character you play. ` +
+    `Write only what ${c.name} says and does. Never write ${u}'s words, actions, thoughts or feelings, never reply as ${u}, and never narrate what ${u} does next. ` +
+    `This is private fiction: stay fully in character as ${c.name}, and never break character to lecture, moralize or add disclaimers. Keep replies natural and conversational. Use *asterisks* for ${c.name}'s actions.` +
+    `\n\nIn the notes below, "you"/"your" in ${u}'s section means ${u}, not ${c.name}.`;
+  if (c.personality || c.style) sys += `\n\n### ${c.name} (the character YOU play)`;
+  if (c.personality) sys += `\nPersonality and background:\n${c.personality}`;
+  if (c.style) sys += `\nHow ${c.name} talks:\n${c.style}`;
+  if (c.role) sys += `\n\n### ${u} (the person you are talking to, NOT you)\nWho ${u} is in this story (always treat ${u} this way):\n${c.role}`;
   if (c.scenario) sys += `\n\nScenario:\n${c.scenario}`;
   if (c.memory) sys += `\n\nThings ${c.name} always remembers:\n${c.memory}`;
   const greeting = chat.find(m => m.greeting);
@@ -218,7 +222,7 @@ async function summarizeIfNeeded(c, chat){
   let cut = 0;
   while (cut < recent.length - 2 && total > KEEP_AFTER_SUMMARY) { total -= recent[cut].content.length; cut++; }
   if (!cut) return;
-  const u = state.userName || 'You';
+  const u = userLabel();
   const lines = recent.slice(0, cut).map(m => `${m.role === 'user' ? u : c.name}: ${m.content}`).join('\n');
   statusMsg = `${c.name} is updating their memory…`; paintStatus();
   try {
@@ -237,9 +241,10 @@ async function summarizeIfNeeded(c, chat){
   } catch {} finally { statusMsg = ''; paintStatus(); try { await engine.resetChat(); } catch {} }
 }
 
+function userLabel(){ const n = (state.userName||'').trim(); return (!n || /^you$/i.test(n)) ? 'User' : n; }
 function cleanReply(text, c){
   let t = text.replace(new RegExp('^\\s*' + c.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\s*:\\s*'), '');
-  const u = (state.userName||'You').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const u = userLabel().replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
   const cut = t.search(new RegExp('\\n\\s*' + u + '\\s*:'));
   if (cut > 0) t = t.slice(0, cut);
   return t.trim();
@@ -285,6 +290,8 @@ function renderList(){
       <button class="icon" id="settings" title="Settings">⚙️</button>
       <button class="icon" id="lock" title="Lock">🔒</button></header>
     <main>
+      ${userLabel() === 'User' ? `<div class="card" id="setname" style="border-color:var(--accent)"><div class="avatar">👤</div>
+        <div class="info"><div class="name">Set your name</div><div class="sub">Helps characters keep you and them separate. Tap here.</div></div></div>` : ''}
       ${cs.length ? cs.map(c => {
         const last = (state.chats[c.id]||[]).filter(m=>m.content).slice(-1)[0];
         return `<div class="card" data-id="${c.id}"><div class="avatar">${esc(c.avatar||'🙂')}</div>
@@ -293,7 +300,8 @@ function renderList(){
       }).join('') : `<div class="empty">No characters yet.<br>Make your first one below.</div>`}
       <button class="primary" id="new" style="width:100%;margin-top:6px">＋ New character</button>
     </main>`;
-  $app.querySelectorAll('.card').forEach(el => el.onclick = () => { view = { name:'chat', id:el.dataset.id }; render(); });
+  const sn = document.getElementById('setname'); if (sn) sn.onclick = e => { e.stopPropagation(); view = { name:'settings' }; render(); };
+  $app.querySelectorAll('.card[data-id]').forEach(el => el.onclick = () => { view = { name:'chat', id:el.dataset.id }; render(); });
   document.getElementById('new').onclick = () => { view = { name:'edit', id:null }; render(); };
   document.getElementById('settings').onclick = () => { view = { name:'settings' }; render(); };
   document.getElementById('lock').onclick = lock;
@@ -423,7 +431,7 @@ async function respond(c, chat){
     await ensureEngine();
     await summarizeIfNeeded(c, chat.slice(0, -1));
     const msgs = buildMessages(c, chat.slice(0, -1));
-    const stream = await engine.chat.completions.create({ messages:msgs, stream:true, temperature:0.8, top_p:0.95, max_tokens:350, frequency_penalty:0.4 });
+    const stream = await engine.chat.completions.create({ messages:msgs, stream:true, temperature:0.8, top_p:0.95, max_tokens:350, frequency_penalty:0.4, stop:[`\n${userLabel()}:`, `\n${userLabel()} :`, '\nUser:', `\n**${userLabel()}`] });
     for await (const part of stream) {
       reply.content += part.choices[0]?.delta?.content || '';
       if (view.name === 'chat' && view.id === c.id) {
