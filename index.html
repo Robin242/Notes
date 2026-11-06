@@ -202,6 +202,9 @@ function buildMessages(c, chat){
     if (last && last.role === m.role) last.content += '\n' + m.content;
     else msgs.push({ role:m.role, content:m.content });
   }
+  const lastMsg = msgs[msgs.length-1];
+  if (lastMsg && lastMsg.role === 'user')
+    lastMsg.content += `\n\n[Reply as ${c.name} only: one short reply of 1-2 paragraphs, then stop and wait for ${u}. Do not write anything ${u} says or does.]`;
   return [{ role:'system', content:sys }, ...msgs];
 }
 /* ---------------- long-term memory ---------------- */
@@ -242,11 +245,24 @@ async function summarizeIfNeeded(c, chat){
 }
 
 function userLabel(){ const n = (state.userName||'').trim(); return (!n || /^you$/i.test(n)) ? 'User' : n; }
+function stopCues(c){
+  const u = userLabel();
+  return [`\n${u}:`, `\n${u} :`, `\n${u} `, `\n*${u} `, `\n**${u}`, `\n(${u}`, `\n[${u}`, '\nUser:', `\n${c.name}:`, '\n[Reply as'];
+}
 function cleanReply(text, c){
-  let t = text.replace(new RegExp('^\\s*' + c.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\s*:\\s*'), '');
-  const u = userLabel().replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-  const cut = t.search(new RegExp('\\n\\s*' + u + '\\s*:'));
-  if (cut > 0) t = t.slice(0, cut);
+  const rx = s => s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const u = rx(userLabel()), n = rx(c.name);
+  let t = text.replace(new RegExp('^\\s*' + n + '\\s*:\\s*'), '');
+  // cut where the model starts writing the user's part or a new turn
+  const cuts = [
+    new RegExp('\\n\\s*[*(\\[]*\\s*' + u + '\\b'),
+    new RegExp('\\n\\s*User\\s*:'),
+    new RegExp('\\n\\s*' + n + '\\s*:'),
+    /\n\s*\[Reply as/,
+  ];
+  for (const r of cuts) { const i = t.search(r); if (i > 0) t = t.slice(0, i); }
+  // keep at most 3 paragraphs
+  t = t.split(/\n\s*\n/).slice(0, 3).join('\n\n');
   return t.trim();
 }
 
@@ -431,7 +447,7 @@ async function respond(c, chat){
     await ensureEngine();
     await summarizeIfNeeded(c, chat.slice(0, -1));
     const msgs = buildMessages(c, chat.slice(0, -1));
-    const stream = await engine.chat.completions.create({ messages:msgs, stream:true, temperature:0.8, top_p:0.95, max_tokens:350, frequency_penalty:0.4, stop:[`\n${userLabel()}:`, `\n${userLabel()} :`, '\nUser:', `\n**${userLabel()}`] });
+    const stream = await engine.chat.completions.create({ messages:msgs, stream:true, temperature:0.8, top_p:0.95, max_tokens:220, stop:stopCues(c) });
     for await (const part of stream) {
       reply.content += part.choices[0]?.delta?.content || '';
       if (view.name === 'chat' && view.id === c.id) {
