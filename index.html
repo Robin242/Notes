@@ -36,6 +36,11 @@
   .err{color:var(--danger);min-height:22px;margin-top:8px;font-size:14px}
   .msgs{display:flex;flex-direction:column;gap:10px}
   .bubble{max-width:86%;padding:10px 13px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word}
+  main.bg{background-size:cover;background-position:center;background-repeat:no-repeat}
+  main.bg .bubble.ai{background:rgba(35,39,50,.88)}
+  main.bg .bubble.me{background:rgba(59,53,112,.92)}
+  main.bg .empty{color:#fff;text-shadow:0 1px 3px #000}
+  .thumb{width:100%;height:160px;border-radius:12px;border:1px solid var(--line);background:var(--panel2) center/cover no-repeat;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:14px}
   .bubble.ai{background:var(--panel2);align-self:flex-start;border-bottom-left-radius:4px}
   .bubble.me{background:var(--me);align-self:flex-end;border-bottom-right-radius:4px}
   .bubble em{color:#c6bff9}
@@ -63,9 +68,12 @@
 
 const VAULT_KEY = 'pc_vault_v1';
 const LOCK_AFTER_MS = 2 * 60 * 1000;     // auto-lock after 2 min in background
-const CONTEXT_TOKENS = 8192;             // AI's working memory (2x the default)
-const HISTORY_CHARS = 18000;             // recent chat the AI reads word-for-word
-const KEEP_AFTER_SUMMARY = 10000;        // after folding old chat into memory, keep this much verbatim
+// Speed vs memory. "fast" is lighter on the phone; long-term memory notes work in both.
+const PERF = {
+  fast:   { ctx: 4096, history: 9000,  keep: 5000,  label: 'Fast (lighter on your phone)' },
+  memory: { ctx: 8192, history: 18000, keep: 10000, label: 'More memory (heavier, slower)' },
+};
+const perf = () => PERF[state?.perf] || PERF.fast;
 const MODEL_PREFS = [
   { base: 'Hermes-3-Llama-3.2-3B-', label: 'Hermes 3 (3B), least filtered, best for roleplay' },
   { base: 'Llama-3.2-3B-Instruct-', label: 'Llama 3.2 (3B), balanced' },
@@ -92,33 +100,98 @@ async function deriveKey(pass, saltBytes){
   return crypto.subtle.deriveKey({ name:'PBKDF2', salt:saltBytes, iterations:600000, hash:'SHA-256' },
     base, { name:'AES-GCM', length:256 }, false, ['encrypt','decrypt']);
 }
+const enc = (k, iv, data) => crypto.subtle.encrypt({ name:'AES-GCM', iv }, k, data);
+const dec = (k, iv, data) => crypto.subtle.decrypt({ name:'AES-GCM', iv }, k, data);
+const newIv = () => crypto.getRandomValues(new Uint8Array(12));
+
+/* ---------------- on-device storage (IndexedDB: room for photos) ---------------- */
+let dbp = null;
+function db(){
+  return dbp ??= new Promise((res, rej) => {
+    const r = indexedDB.open('private-characters', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function idb(mode, fn){
+  const d = await db();
+  return new Promise((res, rej) => {
+    const tx = d.transaction('kv', mode); const r = fn(tx.objectStore('kv'));
+    tx.oncomplete = () => res(r?.result); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error);
+  });
+}
+const kvGet = k => idb('readonly', s => s.get(k));
+const kvSet = (k, v) => idb('readwrite', s => s.put(v, k));
+const kvDel = k => idb('readwrite', s => s.delete(k));
+const kvKeys = () => idb('readonly', s => s.getAllKeys());
+
+async function loadVault(){
+  let v = await kvGet('vault');
+  if (!v) {                                     // move data from the older version of the app
+    const old = localStorage.getItem(VAULT_KEY);
+    if (old) {
+      const o = JSON.parse(old);
+      v = { v:2, salt:fromB64(o.salt), iv:fromB64(o.iv), ct:fromB64(o.ct).buffer };
+      await kvSet('vault', v);
+      localStorage.removeItem(VAULT_KEY);
+    }
+  }
+  return v;
+}
 async function save(){
   if (!key || !state) return;
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, te.encode(JSON.stringify(state)));
-  try {
-    localStorage.setItem(VAULT_KEY, JSON.stringify({ v:1, salt:toB64(salt), iv:toB64(iv), ct:toB64(ct) }));
-  } catch (e) {
-    alert('Storage is full. Export a backup, then clear some old chats.');
-  }
+  const iv = newIv();
+  const ct = await enc(key, iv, te.encode(JSON.stringify(state)));
+  try { await kvSet('vault', { v:2, salt, iv, ct }); }
+  catch { alert('Could not save. Your phone may be out of storage space.'); }
 }
 async function unlock(pass){
-  const vault = JSON.parse(localStorage.getItem(VAULT_KEY));
-  const s = fromB64(vault.salt);
+  const vault = await loadVault();
+  const s = new Uint8Array(vault.salt);
   const k = await deriveKey(pass, s);
-  const pt = await crypto.subtle.decrypt({ name:'AES-GCM', iv:fromB64(vault.iv) }, k, fromB64(vault.ct));
+  const pt = await dec(k, vault.iv, vault.ct);
   salt = s; key = k; state = JSON.parse(td.decode(pt));
   state.characters ??= []; state.chats ??= {}; state.userName ??= 'You';
 }
 async function createVault(pass){
   salt = crypto.getRandomValues(new Uint8Array(16));
   key = await deriveKey(pass, salt);
-  state = { userName:'You', model:null, characters:[], chats:{} };
+  state = { userName:'You', model:null, perf:'fast', characters:[], chats:{} };
   await save();
 }
+
+/* ---------------- chat background photos (encrypted too) ---------------- */
+const imgCache = new Map();
+async function shrinkImage(file){
+  const bmp = await createImageBitmap(file);
+  const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+  const cv = document.createElement('canvas');
+  cv.width = Math.round(bmp.width * scale); cv.height = Math.round(bmp.height * scale);
+  cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+  return new Promise(r => cv.toBlob(r, 'image/jpeg', 0.85));
+}
+async function setImage(id, blob){
+  dropImageCache(id);
+  if (!blob) return kvDel('img:' + id);
+  const iv = newIv();
+  await kvSet('img:' + id, { iv, ct: await enc(key, iv, await blob.arrayBuffer()), type: blob.type });
+}
+async function getImageURL(id){
+  if (imgCache.has(id)) return imgCache.get(id);
+  const r = await kvGet('img:' + id); if (!r || !key) return null;
+  try {
+    const url = URL.createObjectURL(new Blob([await dec(key, r.iv, r.ct)], { type: r.type }));
+    imgCache.set(id, url); return url;
+  } catch { return null; }
+}
+function dropImageCache(id){
+  for (const [k, u] of imgCache) if (id === undefined || k === id) { URL.revokeObjectURL(u); imgCache.delete(k); }
+}
+
 function lock(){
   key = null; state = null; view = { name:'list' };
-  if (engine && !generating) { try { engine.resetChat(); } catch {} }
+  dropImageCache();
+  if (!generating) unloadEngine();   // free your phone's memory while locked
   render();
 }
 document.addEventListener('visibilitychange', () => {
@@ -127,15 +200,22 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /* ---------------- AI engine (WebLLM, runs on your GPU) ---------------- */
-let webllm = null, engine = null, loadedModel = null, loadingPromise = null, generating = false;
+let webllm = null, libUrl = null, engine = null, worker = null, loadedModel = null, loadedPerf = null, loadingPromise = null, generating = false;
 let progress = { pct:0, text:'' };
 let statusMsg = '';
+let paintQueued = false;
 
 async function getLib(){
   if (webllm) return webllm;
-  try { webllm = await import('https://esm.run/@mlc-ai/web-llm@0.2.79'); }
-  catch { webllm = await import('https://esm.run/@mlc-ai/web-llm'); }
-  return webllm;
+  for (const u of ['https://esm.run/@mlc-ai/web-llm@0.2.79', 'https://esm.run/@mlc-ai/web-llm']) {
+    try { webllm = await import(u); libUrl = u; return webllm; } catch (e) { if (u.endsWith('web-llm')) throw e; }
+  }
+}
+async function unloadEngine(){
+  const e = engine, w = worker;
+  engine = null; worker = null; loadedModel = null;
+  try { await e?.unload(); } catch {}
+  try { w?.terminate(); } catch {}
 }
 async function modelOptions(){
   const lib = await getLib();
@@ -152,22 +232,28 @@ async function ensureEngine(){
   if (!navigator.gpu) throw new Error('This browser has no WebGPU. Update Chrome and open this page from http://localhost.');
   const opts = await modelOptions();
   const want = (state.model && opts.some(o => o.id === state.model)) ? state.model : opts[0].id;
-  if (engine && loadedModel === want) return engine;
+  const p = state.perf || 'fast';
+  if (engine && loadedModel === want && loadedPerf === p) return engine;
   if (loadingPromise) return loadingPromise;
   const lib = await getLib();
   const cb = r => { progress = { pct: Math.round((r.progress||0)*100), text: r.text||'' }; paintStatus(); };
   loadingPromise = (async () => {
     progress = { pct:0, text:'Starting AI…' }; paintStatus();
-    const big = { context_window_size: CONTEXT_TOKENS };
+    await unloadEngine();
+    const opts = { context_window_size: perf().ctx };
+    // Run the AI in a background worker so the screen stays smooth while it thinks.
     try {
-      if (engine) await engine.reload(want, big);
-      else engine = await lib.CreateMLCEngine(want, { initProgressCallback: cb }, big);
+      const src = `import * as w from '${libUrl}'; const h = new w.WebWorkerMLCEngineHandler(); self.onmessage = m => h.onmessage(m);`;
+      worker = new Worker(URL.createObjectURL(new Blob([src], { type:'text/javascript' })), { type:'module' });
+      const failed = new Promise((_, rej) => worker.addEventListener('error', () => rej(new Error('worker failed')), { once:true }));
+      engine = await Promise.race([lib.CreateWebWorkerMLCEngine(worker, want, { initProgressCallback: cb }, opts), failed]);
     } catch (e) {
-      // fall back to the model's default memory size if the bigger one doesn't fit
-      if (engine) await engine.reload(want);
-      else engine = await lib.CreateMLCEngine(want, { initProgressCallback: cb });
+      // fallback: run on the page itself
+      try { worker?.terminate(); } catch {}
+      worker = null;
+      engine = await lib.CreateMLCEngine(want, { initProgressCallback: cb }, opts);
     }
-    loadedModel = want; progress = { pct:100, text:'' };
+    loadedModel = want; loadedPerf = p; progress = { pct:100, text:'' };
     return engine;
   })();
   try { return await loadingPromise; } finally { loadingPromise = null; paintStatus(); }
@@ -194,7 +280,7 @@ function buildMessages(c, chat){
   // recent history (everything not yet folded into memory), starting with a user turn and alternating
   const hist = chat.filter(m => !m.greeting && m.content).slice(mem.upto);
   const picked = []; let total = 0;
-  for (let i = hist.length - 1; i >= 0; i--) { total += hist[i].content.length; if (total > HISTORY_CHARS && picked.length) break; picked.unshift(hist[i]); }
+  for (let i = hist.length - 1; i >= 0; i--) { total += hist[i].content.length; if (total > perf().history && picked.length) break; picked.unshift(hist[i]); }
   while (picked.length && picked[0].role !== 'user') picked.shift();
   const msgs = [];
   for (const m of picked) {
@@ -221,9 +307,9 @@ async function summarizeIfNeeded(c, chat){
   const hist = chat.filter(m => !m.greeting && m.content);
   const recent = hist.slice(mem.upto);
   let total = recent.reduce((s, m) => s + m.content.length, 0);
-  if (total <= HISTORY_CHARS) return;
+  if (total <= perf().history) return;
   let cut = 0;
-  while (cut < recent.length - 2 && total > KEEP_AFTER_SUMMARY) { total -= recent[cut].content.length; cut++; }
+  while (cut < recent.length - 2 && total > perf().keep) { total -= recent[cut].content.length; cut++; }
   if (!cut) return;
   const u = userLabel();
   const lines = recent.slice(0, cut).map(m => `${m.role === 'user' ? u : c.name}: ${m.content}`).join('\n');
@@ -272,8 +358,10 @@ function render(){
   ({ list:renderList, edit:renderEdit, chat:renderChat, settings:renderSettings })[view.name]();
 }
 
-function renderLock(){
-  const exists = !!localStorage.getItem(VAULT_KEY);
+async function renderLock(){
+  let exists = false;
+  try { exists = !!(await loadVault()); } catch {}
+  if (key) return;
   $app.innerHTML = `<main><div class="center">
     <div style="font-size:48px">🔒</div>
     <h1 style="font-size:22px">${exists ? 'Unlock' : 'Create your passphrase'}</h1>
@@ -339,6 +427,11 @@ function renderEdit(){
       <textarea id="f_scenario" rows="3" placeholder="Where are you two and what's going on?">${esc(c.scenario)}</textarea>
       <label>First message (optional)</label>
       <textarea id="f_greeting" rows="3" placeholder="What they say when a chat starts.">${esc(c.greeting)}</textarea>
+      <label>Chat background (optional)</label>
+      <div class="thumb" id="f_thumb">No background</div>
+      <div class="row" style="margin-top:8px"><button id="f_pick">Choose photo</button><button id="f_noimg" hidden>Remove</button></div>
+      <input type="file" id="f_imgfile" accept="image/*" hidden>
+      <div class="hint">The photo is shrunk, encrypted and kept only on this phone.</div>
       <label>Things they always remember (optional)</label>
       <textarea id="f_memory" rows="3" placeholder="Facts they should never forget, e.g. your birthday, how you met, your dog's name.">${esc(c.memory||'')}</textarea>
       ${view.id ? `<label>Their memory of your chat (written automatically)</label>
@@ -352,6 +445,23 @@ function renderEdit(){
     </main>`;
   const back = () => { view = view.id ? { name:'chat', id:view.id } : { name:'list' }; render(); };
   document.getElementById('back').onclick = back;
+  // background photo: undefined = unchanged, null = remove, Blob = new photo
+  let pendingImg, previewUrl = null;
+  const thumb = document.getElementById('f_thumb'), noimg = document.getElementById('f_noimg'), imgfile = document.getElementById('f_imgfile');
+  const showThumb = url => { thumb.style.backgroundImage = url ? `url("${url}")` : ''; thumb.textContent = url ? '' : 'No background'; noimg.hidden = !url; };
+  if (view.id) getImageURL(view.id).then(u => { if (pendingImg === undefined) showThumb(u); });
+  document.getElementById('f_pick').onclick = () => imgfile.click();
+  imgfile.onchange = async () => {
+    const f = imgfile.files[0]; if (!f) return;
+    thumb.textContent = 'Loading…';
+    try {
+      pendingImg = await shrinkImage(f);
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(pendingImg); showThumb(previewUrl);
+    } catch { thumb.textContent = "Couldn't read that photo"; }
+  };
+  noimg.onclick = () => { pendingImg = null; showThumb(null); };
+
   document.getElementById('save').onclick = async () => {
     const g = id => document.getElementById(id).value.trim();
     const data = { name:g('f_name'), avatar:g('f_avatar')||'🙂', personality:g('f_personality'), style:g('f_style'), scenario:g('f_scenario'), greeting:g('f_greeting'), memory:g('f_memory'), role:g('f_role') };
@@ -362,13 +472,16 @@ function renderEdit(){
       if (document.getElementById('f_auto')) getMem(ch).text = g('f_auto');
     }
     else { const id = uid(); state.characters.push({ id, ...data }); view.id = id; }
-    await save(); view = { name:'chat', id:view.id }; render();
+    await save();
+    if (pendingImg !== undefined) { try { await setImage(view.id, pendingImg); } catch { alert("Couldn't save the photo. Your phone may be low on storage."); } }
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    view = { name:'chat', id:view.id }; render();
   };
   const del = document.getElementById('del');
   if (del) del.onclick = async () => {
     if (!confirm(`Delete ${c.name} and the whole chat with them? This can't be undone.`)) return;
     state.characters = state.characters.filter(x => x.id !== view.id);
-    delete state.chats[view.id]; if (state.memory) delete state.memory[view.id]; await save(); view = { name:'list' }; render();
+    delete state.chats[view.id]; if (state.memory) delete state.memory[view.id]; await save(); await setImage(view.id, null); view = { name:'list' }; render();
   };
 }
 
@@ -405,6 +518,10 @@ function renderChat(){
     respond(c, chat);
   };
   paintMsgs(c, chat); paintStatus();
+  getImageURL(c.id).then(url => {
+    const sc = document.getElementById('scroll');
+    if (url && sc && view.name === 'chat' && view.id === c.id) { sc.classList.add('bg'); sc.style.backgroundImage = `linear-gradient(rgba(17,19,24,.45),rgba(17,19,24,.45)), url("${url}")`; }
+  });
 }
 
 function paintMsgs(c, chat){
@@ -450,10 +567,15 @@ async function respond(c, chat){
     const stream = await engine.chat.completions.create({ messages:msgs, stream:true, temperature:0.8, top_p:0.95, max_tokens:220, stop:stopCues(c) });
     for await (const part of stream) {
       reply.content += part.choices[0]?.delta?.content || '';
-      if (view.name === 'chat' && view.id === c.id) {
-        const bubbles = document.querySelectorAll('#msgs .bubble');
-        const b = bubbles[bubbles.length-1];
-        if (b) { b.innerHTML = fmt(reply.content); const sc = document.getElementById('scroll'); sc.scrollTop = sc.scrollHeight; }
+      // redraw at most ~8 times a second instead of on every word
+      if (!paintQueued && view.name === 'chat' && view.id === c.id) {
+        paintQueued = true;
+        setTimeout(() => {
+          paintQueued = false;
+          const bubbles = document.querySelectorAll('#msgs .bubble');
+          const b = bubbles[bubbles.length-1];
+          if (b && generating) { b.innerHTML = fmt(reply.content); const sc = document.getElementById('scroll'); sc.scrollTop = sc.scrollHeight; }
+        }, 120);
       }
     }
     reply.content = cleanReply(reply.content, c);
@@ -474,7 +596,10 @@ async function renderSettings(){
       <input id="s_user" value="${esc(state.userName)}">
       <label>AI model</label>
       <select id="s_model"><option>Checking what your phone supports…</option></select>
-      <div class="hint">Bigger models write better, smaller ones reply faster. Each model is a separate one-time download.</div>
+      <div class="hint">Bigger models write better, smaller ones reply faster. Each model is a separate one-time download. If your phone still feels slow, try Llama 3.2 (1B).</div>
+      <label>Speed vs memory</label>
+      <select id="s_perf">${Object.entries(PERF).map(([k,v]) => `<option value="${k}" ${(state.perf||'fast') === k ? 'selected' : ''}>${v.label}</option>`).join('')}</select>
+      <div class="hint">Both keep long-term memory notes. "More memory" also re-reads more of the recent chat word for word, which uses more of your phone.</div>
       <button class="primary" id="s_save" style="width:100%;margin-top:14px">Save</button>
 
       <h2>Backup</h2>
@@ -491,10 +616,17 @@ async function renderSettings(){
   document.getElementById('s_save').onclick = async () => {
     state.userName = document.getElementById('s_user').value.trim() || 'You';
     const m = document.getElementById('s_model').value; if (m && !m.startsWith('Checking')) state.model = m;
+    state.perf = document.getElementById('s_perf').value;
     await save(); view = { name:'list' }; render();
   };
-  document.getElementById('export').onclick = () => {
-    const blob = new Blob([localStorage.getItem(VAULT_KEY)], { type:'application/json' });
+  document.getElementById('export').onclick = async () => {
+    await save();
+    const v = await kvGet('vault');
+    const out = { v:2, salt:toB64(v.salt), iv:toB64(v.iv), ct:toB64(v.ct), images:{} };
+    for (const k of await kvKeys()) if (String(k).startsWith('img:')) {
+      const r = await kvGet(k); out.images[k.slice(4)] = { iv:toB64(r.iv), ct:toB64(r.ct), type:r.type };
+    }
+    const blob = new Blob([JSON.stringify(out)], { type:'application/json' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
     a.download = `characters-backup-${new Date().toISOString().slice(0,10)}.json`; a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
@@ -507,14 +639,23 @@ async function renderSettings(){
       const txt = await f.text(); const v = JSON.parse(txt);
       if (!v.salt || !v.iv || !v.ct) throw 0;
       if (!confirm('Replace everything here with this backup? You will need the passphrase the backup was made with.')) return;
-      localStorage.setItem(VAULT_KEY, txt); lock();
+      for (const k of await kvKeys()) if (String(k).startsWith('img:')) await kvDel(k);
+      await kvSet('vault', { v:2, salt:fromB64(v.salt), iv:fromB64(v.iv), ct:fromB64(v.ct).buffer });
+      for (const [id, r] of Object.entries(v.images || {}))
+        await kvSet('img:' + id, { iv:fromB64(r.iv), ct:fromB64(r.ct).buffer, type:r.type });
+      lock();
     } catch { alert("That doesn't look like a backup file from this app."); }
   };
   document.getElementById('chpass').onclick = async () => {
     const a = document.getElementById('np1').value, b = document.getElementById('np2').value;
     if (a.length < 6) return alert('Use at least 6 characters.');
     if (a !== b) return alert("Passphrases don't match.");
-    salt = crypto.getRandomValues(new Uint8Array(16)); key = await deriveKey(a, salt);
+    const newSalt = crypto.getRandomValues(new Uint8Array(16)), newKey = await deriveKey(a, newSalt);
+    for (const k of await kvKeys()) if (String(k).startsWith('img:')) {     // re-lock photos with the new passphrase
+      const r = await kvGet(k); const pt = await dec(key, r.iv, r.ct); const iv = newIv();
+      await kvSet(k, { iv, ct: await enc(newKey, iv, pt), type:r.type });
+    }
+    salt = newSalt; key = newKey; dropImageCache();
     await save(); alert('Passphrase changed. Export a new backup, since old backups still use the old passphrase.');
     document.getElementById('np1').value = document.getElementById('np2').value = '';
   };
